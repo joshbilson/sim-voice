@@ -55,6 +55,11 @@ class SourceRules(unittest.TestCase):
         self.assertNotIn("dist.tgz", server)
         self.assertNotIn("get_lan_ip", server)
 
+    def test_warmup_runs_one_system_prompt_pass_before_the_first_call(self):
+        server = read("server.py")
+        self.assertIn("state.warmup(voice_prompt=args.default_voice, text_prompt=default_text_prompt)", server)
+        self.assertIn("def _warm_system_prompts(", server)
+
     def test_request_lines_are_never_access_logged(self):
         self.assertIn("access_log=None", read("server.py"))
 

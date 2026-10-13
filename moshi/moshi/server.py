@@ -29,6 +29,7 @@
 # torch and are tested without a GPU. Protocol and flags: SIM.md.
 
 import argparse
+import asyncio
 import os
 import random
 import ssl
@@ -156,7 +157,7 @@ class ServerState:
             self.other_mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
 
-    def warmup(self):
+    def warmup(self, voice_prompt: Optional[str] = None, text_prompt: str = ""):
         # dtype follows mimi (fp32 stock; fp16 only under --mimi-fp16)
         warmup_dtype = next(self.mimi.parameters()).dtype
         for _ in range(4):
@@ -172,6 +173,23 @@ class ServerState:
                 if self.other_mimi is not None:
                     _ = self.other_mimi.decode(tokens[:, 1:9])
 
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()
+        if voice_prompt is not None:
+            self._warm_system_prompts(voice_prompt, text_prompt)
+
+    def _warm_system_prompts(self, voice_prompt: str, text_prompt: str) -> None:
+        """One full system-prompt pass (default voice and persona), then reset.
+
+        The first real call would otherwise be the first to run the voice-prompt path, which
+        captures its CUDA graph and runs first-use kernels inside that call's handshake.
+        """
+        async def always_alive() -> bool:
+            return True
+
+        asyncio.run(self.run_system_prompts(voice_prompt=voice_prompt, text_prompt=text_prompt,
+                                            seed=None, is_alive=always_alive))
+        self.reset()
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
 
@@ -423,7 +441,7 @@ def _serve(args: argparse.Namespace, token: Optional[str], default_text_prompt: 
         dep_q_exit=args.dep_q_exit,
     )
     logger.info("warming up the model")
-    state.warmup()
+    state.warmup(voice_prompt=args.default_voice, text_prompt=default_text_prompt)
     if args.fp8:
         from .fp8_quantize import free_bf16_inproj
         free_bf16_inproj(lm)
