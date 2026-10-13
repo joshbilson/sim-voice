@@ -44,7 +44,7 @@ from .w8a16_format import (
     read_header,
     sha256_file,
 )
-from .w8a16_quantize import attach_w8a16_structure, w8a16_targets
+from .w8a16_quantize import attach_w8a16_structure, scale_from_amax, w8a16_targets
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ def row_scales(w: torch.Tensor, chunk: int = ROW_CHUNK) -> torch.Tensor:
     amax = torch.empty(w.shape[0], dtype=torch.float32)
     for start in range(0, w.shape[0], chunk):
         amax[start:start + chunk] = w[start:start + chunk].abs().amax(dim=1).float()
-    return (amax / 448.0).clamp(min=1e-12)
+    return scale_from_amax(amax)
 
 
 def iter_fp8_rows(w: torch.Tensor, scale: torch.Tensor, chunk: int = ROW_CHUNK):

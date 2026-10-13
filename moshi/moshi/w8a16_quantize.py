@@ -227,10 +227,21 @@ def _make_attn_forward():
 # therefore produce the same state dict keys, shapes and dtypes.
 # ============================================================================
 
+def scale_from_amax(amax):
+    """fp32 per-channel scale from the per-row absolute maximum.
+
+    The divisor is a tensor, not a Python scalar: CUDA rewrites `x / 448.0` as a multiply by the
+    reciprocal, which rounds differently from the CPU's division (about 60% of scales differ by an
+    ulp). With a tensor divisor both devices round the same way, so the offline converter (CPU) and
+    the online path (GPU) store identical bytes.
+    """
+    return (amax / torch.full_like(amax, 448.0)).clamp(min=1e-12)
+
+
 def _quantize_weight(w):
-    """Per-output-channel fp8e4m3 storage. Returns (w_fp8, scale_fp32)."""
+    """Per-output-channel fp8e4m3 storage. Returns (w_fp8, scale_fp32). Device-independent."""
     amax = w.abs().amax(dim=1).float()
-    scale = (amax / 448.0).clamp(min=1e-12)
+    scale = scale_from_amax(amax)
     w_fp8 = (w.float() / scale[:, None]).to(torch.float8_e4m3fn)
     return w_fp8, scale
 
