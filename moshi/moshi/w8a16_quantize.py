@@ -91,9 +91,9 @@ def w8a16_linear(x, w_fp8, scale, bias=None):
     in_features = w_fp8.shape[1]
     out_features = w_fp8.shape[0]
     x2 = x.reshape(-1, in_features)
-    if x2.shape[0] != 1:
-        # Rare non-decode path (prompt batches etc.): correctness fallback,
-        # full dequant + cuBLAS.
+    if x2.shape[0] != 1 or x.device.type != "cuda":
+        # Rare non-decode path (prompt batches etc.) and CPU (tests): correctness
+        # fallback, full dequant + framework matmul.
         w = (w_fp8.to(torch.float32) * scale[:, None]).to(x.dtype)
         return F.linear(x, w, bias).reshape(*orig_shape[:-1], out_features)
     y = torch.empty(1, out_features, device=x.device, dtype=x.dtype)
@@ -219,6 +219,12 @@ def _make_attn_forward():
 
 # ============================================================================
 # Weight quantization
+#
+# One place decides which modules are converted (w8a16_targets) and one place
+# attaches the converted layout (_attach_*). The online path quantizes real
+# weights with it; the offline checkpoint path (w8a16_checkpoint.py) attaches the
+# same layout to a meta-device model and loads the stored tensors into it. Both
+# therefore produce the same state dict keys, shapes and dtypes.
 # ============================================================================
 
 def _quantize_weight(w):
@@ -229,12 +235,95 @@ def _quantize_weight(w):
     return w_fp8, scale
 
 
-def quantize_linear_w8a16(module):
-    w_fp8, scale = _quantize_weight(module.weight.data)
+def install_forward_patches():
+    """Class-level forward patches that dispatch on the per-instance w8a16 markers."""
+    import moshi.modules.gating as gating_mod
+    import moshi.modules.transformer as tf_mod
+
+    gating_mod.ActivationGating.forward = _make_gating_forward()
+    tf_mod.StreamingMultiheadAttention.forward = _make_attn_forward()
+
+
+def w8a16_targets(model, min_features=512):
+    """(module name, kind) for every module that w8a16 converts, in a fixed order.
+
+    kind 'linear': an nn.Linear whose weight becomes fp8 (+ w8a16_scale).
+    kind 'in_proj': a main-attention bare in_proj_weight (+ _in_proj_q_weight/_scale).
+    Coverage mirrors fp8_quantize: small linears and depformer self_attn are skipped.
+    """
+    import moshi.modules.transformer as tf_mod
+
+    targets = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if module.in_features < min_features and module.out_features < min_features:
+                continue
+            if module.weight.ndim > 2:
+                continue
+            if "depformer" in name and "self_attn" in name:
+                continue
+            targets.append((name, "linear"))
+    for name, module in model.named_modules():
+        if isinstance(module, tf_mod.StreamingMultiheadAttention):
+            if "depformer" in name or module.weights_per_step:
+                continue
+            if module.in_proj_weight.ndim != 2:
+                continue
+            targets.append((name, "in_proj"))
+    return targets
+
+
+def _attach_linear_structure(module, w_fp8, scale):
     module.weight = nn.Parameter(w_fp8, requires_grad=False)
     module.register_buffer("w8a16_scale", scale)
     module._is_w8a16 = True
     module.forward = types.MethodType(_w8a16_forward, module)
+
+
+def _attach_in_proj_structure(module, w_fp8, scale, placeholder):
+    module.register_buffer("_in_proj_q_weight", w_fp8)
+    module.register_buffer("_in_proj_q_scale", scale)
+    module._in_proj_w8a16 = True
+    # The bf16 copy is replaced by an empty placeholder: the kernel never reads it.
+    module.in_proj_weight = nn.Parameter(placeholder, requires_grad=False)
+
+
+def quantize_linear_w8a16(module):
+    w_fp8, scale = _quantize_weight(module.weight.data)
+    _attach_linear_structure(module, w_fp8, scale)
+
+
+def quantize_in_proj_w8a16(module):
+    w = module.in_proj_weight.data
+    w_fp8, scale = _quantize_weight(w)
+    _attach_in_proj_structure(module, w_fp8, scale, torch.empty(0, dtype=w.dtype, device=w.device))
+
+
+def attach_w8a16_structure(model, min_features=512):
+    """Give a model (normally on the meta device) the w8a16 layout without any weight data.
+
+    After this, the state dict has the same keys, shapes and dtypes as a model that went through
+    quantize_model_w8a16, so a converted checkpoint can be loaded with assign=True.
+    """
+    install_forward_patches()
+    for name, kind in w8a16_targets(model, min_features):
+        module = model.get_submodule(name)
+        if kind == "linear":
+            w = module.weight
+            _attach_linear_structure(
+                module,
+                torch.empty(w.shape, dtype=torch.float8_e4m3fn, device=w.device),
+                torch.empty(w.shape[0], dtype=torch.float32, device=w.device),
+            )
+        else:
+            w = module.in_proj_weight
+            _attach_in_proj_structure(
+                module,
+                torch.empty(w.shape, dtype=torch.float8_e4m3fn, device=w.device),
+                torch.empty(w.shape[0], dtype=torch.float32, device=w.device),
+                torch.empty(0, dtype=w.dtype, device=w.device),
+            )
+    return model
 
 
 def quantize_model_w8a16(model, min_features=512):
@@ -252,41 +341,17 @@ def quantize_model_w8a16(model, min_features=512):
             "it with `pip install triton`. No silent fallback is provided: "
             "without the kernel the flag cannot meet its performance "
             "contract.")
-    import moshi.modules.gating as gating_mod
-    import moshi.modules.transformer as tf_mod
-
-    gating_mod.ActivationGating.forward = _make_gating_forward()
-    tf_mod.StreamingMultiheadAttention.forward = _make_attn_forward()
+    install_forward_patches()
 
     n_lin = 0
-    for name, module in list(model.named_modules()):
-        if isinstance(module, nn.Linear):
-            if module.in_features < min_features and module.out_features < min_features:
-                continue
-            if module.weight.ndim > 2:
-                continue
-            if "depformer" in name and "self_attn" in name:
-                continue
+    n_inproj = 0
+    for name, kind in w8a16_targets(model, min_features):
+        module = model.get_submodule(name)
+        if kind == "linear":
             quantize_linear_w8a16(module)
             n_lin += 1
-
-    n_inproj = 0
-    for name, module in list(model.named_modules()):
-        if isinstance(module, tf_mod.StreamingMultiheadAttention):
-            if "depformer" in name or module.weights_per_step:
-                continue
-            w = module.in_proj_weight.data
-            if w.ndim != 2:
-                continue
-            w_fp8, scale = _quantize_weight(w)
-            module.register_buffer("_in_proj_q_weight", w_fp8)
-            module.register_buffer("_in_proj_q_scale", scale)
-            module._in_proj_w8a16 = True
-            # free the bf16 copy immediately (kernel never reads it)
-            module.in_proj_weight = nn.Parameter(
-                torch.empty(0, dtype=w.dtype, device=w.device),
-                requires_grad=False,
-            )
+        else:
+            quantize_in_proj_w8a16(module)
             n_inproj += 1
 
     torch.cuda.empty_cache()
