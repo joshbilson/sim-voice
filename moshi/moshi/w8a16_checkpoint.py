@@ -284,20 +284,22 @@ def load_lm_w8a16_checkpoint(path: str, *, device="cuda", lm_kwargs: Optional[di
     return model
 
 
-def _evenly(items: list, count: int) -> list:
-    if len(items) <= count:
+def _evenly(items: list, count: Optional[int]) -> list:
+    if count is None or len(items) <= count:
         return list(items)
     step = (len(items) - 1) / (count - 1) if count > 1 else 0
     return [items[round(i * step)] for i in range(count)]
 
 
-def verify_converted(source: str, converted: str, *, per_kind: int = 3, device=None) -> list[dict]:
+def verify_converted(source: str, converted: str, *, per_kind: Optional[int] = 3, device=None,
+                     include_regular: bool = False) -> list[dict]:
     """Compare stored w8a16 tensors with the online quantizer applied to the source.
 
-    Samples up to per_kind tensors each of 'linear' (non-gating nn.Linear), 'gating' and 'in_proj',
-    recomputes the fp8 weight and fp32 scale from the bf16 source with _quantize_weight, and compares
-    the bytes. With device set, the same quantization also runs on that device and must match too.
-    Reads only the sampled tensors, never the whole model.
+    Samples up to per_kind tensors each of 'linear' (non-gating nn.Linear), 'gating' and 'in_proj'
+    (per_kind=None: all of them), recomputes the fp8 weight and fp32 scale from the bf16 source with
+    _quantize_weight, and compares the bytes. With device set, the same quantization also runs on
+    that device and must match too. include_regular also compares every bf16 tensor that is copied
+    unchanged from the source. Reads only the tensors it checks, never the whole model.
     """
     from .w8a16_quantize import _quantize_weight
 
@@ -306,7 +308,7 @@ def verify_converted(source: str, converted: str, *, per_kind: int = 3, device=N
     source_header = read_header(source)
     fp8_names = [n for n, info in header.tensors.items() if info.dtype == "F8_E4M3"]
 
-    candidates: dict[str, list] = {"linear": [], "gating": [], "in_proj": []}
+    candidates: dict[str, list] = {"linear": [], "gating": [], "in_proj": [], "regular": []}
     for name in sorted(fp8_names):
         if name.endswith("._in_proj_q_weight"):
             module = name[: -len("._in_proj_q_weight")]
@@ -315,11 +317,27 @@ def verify_converted(source: str, converted: str, *, per_kind: int = 3, device=N
             module = name[: -len(".weight")]
             kind = "gating" if ".gating." in name else "linear"
             candidates[kind].append((name, name, f"{module}.w8a16_scale"))
+    if include_regular:
+        quantized = {item[0] for items in candidates.values() for item in items}
+        for name, info in header.tensors.items():
+            if info.dtype != "BF16" or name in quantized or name not in source_header.tensors:
+                continue
+            if source_header.tensors[name].shape != info.shape:
+                continue  # the empty in_proj placeholder
+            candidates["regular"].append((name, name, None))
 
     rows = []
     with safe_open(source, framework="pt", device="cpu") as src_f, \
             safe_open(converted, framework="pt", device="cpu") as conv_f:
         for kind, items in candidates.items():
+            if kind == "regular":
+                for stored_name, source_key, _ in _evenly(items, per_kind):
+                    src_tensor = src_f.get_tensor(source_key).to(BF16)
+                    stored = conv_f.get_tensor(stored_name)
+                    equal = torch.equal(src_tensor.view(torch.uint8), stored.view(torch.uint8))
+                    rows.append({"kind": kind, "tensor": stored_name, "shape": list(stored.shape),
+                                 "cpu_equal": bool(equal)})
+                continue
             usable = [item for item in items if item[1] in source_header.tensors]
             for stored_name, source_key, scale_name in _evenly(usable, per_kind):
                 weight = src_f.get_tensor(source_key).to(BF16)

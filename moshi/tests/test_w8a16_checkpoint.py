@@ -197,6 +197,27 @@ class ConvertedCheckpoint(unittest.TestCase):
         header = read_header(os.path.join(self.root, "w16.safetensors"))
         self.assertEqual(header.metadata[METADATA_PREFIX + "source_sha256"], sha256_file(self.src16))
 
+    def test_verifier_checks_every_tensor_and_catches_a_flipped_byte(self):
+        path = os.path.join(self.root, "w16.safetensors")
+        rows = wc.verify_converted(self.src16, path, per_kind=None, include_regular=True)
+        kinds = {row["kind"] for row in rows}
+        self.assertEqual(kinds, {"linear", "gating", "in_proj", "regular"})
+        self.assertTrue(all(row["cpu_equal"] for row in rows))
+        self.assertEqual(sum(1 for row in rows if row["kind"] != "regular"),
+                         self.summary16["linear_targets"] + self.summary16["in_proj_targets"])
+
+        corrupt = os.path.join(self.root, "corrupt.safetensors")
+        with open(path, "rb") as handle:
+            data = bytearray(handle.read())
+        info = read_header(path).tensors["linears.0.weight"]
+        start = read_header(path).data_start + info.begin
+        data[start + 3] ^= 0x10  # one bit in one stored fp8 weight
+        with open(corrupt, "wb") as handle:
+            handle.write(bytes(data))
+        rows = wc.verify_converted(self.src16, corrupt, per_kind=None)
+        bad = [row["tensor"] for row in rows if not row["cpu_equal"]]
+        self.assertEqual(bad, ["linears.0.weight"])
+
     def test_loader_refuses_another_configuration(self):
         other = dict(self.kwargs, dim=64)
         with self.assertRaises(CheckpointFormatError):

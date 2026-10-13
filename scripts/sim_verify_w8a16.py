@@ -4,7 +4,8 @@
 # Sim fork (joshbilson/sim-voice). Checks a converted w8a16 checkpoint against its bf16 source.
 """Recompute the online w8a16 quantization of a few tensors and compare the stored bytes.
 
-Samples up to --per-kind tensors each of linear, gating and in_proj. Reads only those tensors.
+Samples up to --per-kind tensors each of linear, gating and in_proj (--all: every one, and every
+copied bf16 tensor too). Reads only the tensors it checks.
 --gpu also runs the online quantizer on CUDA and compares with the stored bytes. Exit 0 only if
 every sampled tensor matches.
 
@@ -29,6 +30,8 @@ def main(argv=None) -> int:
     parser.add_argument("--source", required=True)
     parser.add_argument("--converted", required=True)
     parser.add_argument("--per-kind", type=int, default=3)
+    parser.add_argument("--all", action="store_true",
+                        help="check every quantized tensor and every copied bf16 tensor, not a sample")
     parser.add_argument("--gpu", action="store_true", help="also quantize on CUDA and compare")
     args = parser.parse_args(argv)
 
@@ -42,7 +45,8 @@ def main(argv=None) -> int:
             return 2
         device = "cuda"
     try:
-        rows = verify_converted(args.source, args.converted, per_kind=args.per_kind, device=device)
+        rows = verify_converted(args.source, args.converted, per_kind=None if args.all else args.per_kind,
+                                device=device, include_regular=args.all)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
