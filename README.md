@@ -1,3 +1,7 @@
+> **Sim fork** (`joshbilson/sim-voice`, branch `sim`): token-authenticated, one-call-at-a-time WebSocket with 16-bit PCM for the Sim app. Flags, protocol and changes: [SIM.md](SIM.md).
+> Below still applies to the `codec=opus` web client, with two changes: `--ssl` needs an existing `cert.pem` and `key.pem` (nothing is generated), and the gradio flags are removed.
+> Tests: `python3 -m unittest discover -s moshi/tests -v` (needs only aiohttp and numpy, no GPU).
+
 # PersonaPlex: Voice and Role Control for Full Duplex Conversational Speech Models
 
 [![Weights](https://img.shields.io/badge/🤗-Weights-yellow)](https://huggingface.co/nvidia/personaplex-7b-v1)
