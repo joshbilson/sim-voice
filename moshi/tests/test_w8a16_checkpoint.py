@@ -11,6 +11,8 @@ Set W8A16_SOURCE to a real bf16 LM checkpoint and W8A16_CONVERTED to its convert
 run the sampled real-tensor check (test_real_sample_matches_source); it reads only a few tensors.
 """
 
+from __future__ import annotations
+
 import os
 import tempfile
 import unittest
@@ -253,6 +255,84 @@ class ConvertedCheckpoint(unittest.TestCase):
         with self.assertRaises(CheckpointPlanError):
             wc.convert_checkpoint(path, os.path.join(self.root, "bad_out.safetensors"),
                                   lm_kwargs=self.kwargs, min_features=MIN_FEATURES, threads=1)
+
+
+def legacy_loader_state(model, state_dict, copy_missing_weights, device, dtype):
+    """The patch block of get_moshi_lm exactly as it was before the plan (commit 9a4a704, prints
+    removed). Kept here as the reference: the online loader must still produce these tensors."""
+    model_sd = model.state_dict()
+    for name, tensor in list(state_dict.items()):
+        if "depformer" in name and "self_attn" in name and name in model_sd:
+            if tensor.shape != model_sd[name].shape:
+                missing = tensor if copy_missing_weights else model_sd[name][tensor.shape[0]:]
+                state_dict[name] = torch.concat([tensor, missing], dim=0)
+    if copy_missing_weights:
+        to_replace = ["gating", "linears", "depformer_in", "depformer_emb"]
+        for name in model_sd.keys():
+            if name in state_dict:
+                continue
+            replaced = False
+            for old, new in zip(range(8), range(8, 16)):
+                for rep in to_replace:
+                    needle = f"{rep}.{new}."
+                    if needle in name:
+                        src = name.replace(needle, f"{rep}.{old}.")
+                        if src in state_dict:
+                            state_dict[name] = state_dict[src]
+                            replaced = True
+                        break
+                if replaced:
+                    break
+    dev = torch.device(device) if isinstance(device, str) else device
+    for name, tensor in model_sd.items():
+        if name not in state_dict:
+            state_dict[name] = torch.zeros(tensor.shape, dtype=dtype, device=dev)
+    for key in state_dict:
+        state_dict[key] = state_dict[key].to(device=dev, dtype=dtype)
+    return state_dict
+
+
+@unittest.skipUnless(HAVE_TORCH, "needs torch")
+class OnlineLoaderUnchanged(unittest.TestCase):
+    """The plan-based loader must produce the same bf16 tensors as the original patch code."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.TemporaryDirectory()
+        cls.kwargs = tiny_kwargs(16)
+        cls.src = {}
+        for dep_q in (16, 8):
+            path = os.path.join(cls.dir.name, f"src{dep_q}.safetensors")
+            save_file(random_lm_state(tiny_kwargs(dep_q), seed=20 + dep_q), path)
+            cls.src[dep_q] = path
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dir.cleanup()
+
+    def test_plan_gives_the_tensors_of_the_original_patches(self):
+        from safetensors.torch import load_file
+        for dep_q in (16, 8):
+            with self.subTest(dep_q=dep_q):
+                model = LMModel(device="meta", dtype=BF16, **self.kwargs)
+                state = load_file(self.src[dep_q], device="cpu")
+                legacy = legacy_loader_state(model, dict(state), True, "cpu", BF16)
+                new = loaders.apply_checkpoint_plan(model, dict(state), copy_missing_weights=True,
+                                                    dev=torch.device("cpu"), dtype=BF16)
+                for name in model.state_dict():
+                    self.assertTrue(torch.equal(legacy[name].view(torch.uint8), new[name].view(torch.uint8)),
+                                    name)
+
+    def test_get_moshi_lm_end_to_end_matches_the_original_patches(self):
+        from safetensors.torch import load_file
+        for dep_q in (16, 8):
+            with self.subTest(dep_q=dep_q):
+                with mock.patch.object(loaders, "default_lm_kwargs", lambda delays=None: tiny_kwargs(16)):
+                    lm = loaders.get_moshi_lm(self.src[dep_q], device="cpu")
+                ref = LMModel(device="meta", dtype=BF16, **self.kwargs)
+                legacy = legacy_loader_state(ref, load_file(self.src[dep_q], device="cpu"), True, "cpu", BF16)
+                ref.load_state_dict(legacy, strict=False, assign=True)
+                assert_same_state(self, lm, ref)
 
 
 @unittest.skipUnless(HAVE_TORCH and os.environ.get("W8A16_SOURCE") and os.environ.get("W8A16_CONVERTED"),

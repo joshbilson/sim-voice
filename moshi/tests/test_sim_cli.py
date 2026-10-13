@@ -100,5 +100,56 @@ class CliTests(unittest.TestCase):
         self.refused("--default-text-prompt-file", os.path.join(self.dir.name, "absent.txt"))
 
 
+
+
+class W8a16CheckpointFlag(unittest.TestCase):
+    """--w8a16-checkpoint: refusals that need no torch (the file header is read, never the data)."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.parser = build_arg_parser()
+
+    def checkpoint(self, name, version="1"):
+        from moshi.w8a16_format import METADATA_PREFIX, SafetensorsWriter
+        path = os.path.join(self.dir.name, name)
+        writer = SafetensorsWriter(path, [("x", "U8", (1,), 1)], {METADATA_PREFIX + "version": version})
+        writer.write("x", b"\x00")
+        writer.finish()
+        return path
+
+    def refused(self, *argv):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+            validate_serve_args(self.parser, self.parser.parse_args(list(argv)))
+        self.assertEqual(ctx.exception.code, 2)
+        return stderr.getvalue()
+
+    def test_a_converted_file_is_accepted(self):
+        path = self.checkpoint("ok.safetensors")
+        validate_serve_args(self.parser, self.parser.parse_args(["--host", "127.0.0.1", "--w8a16-checkpoint", path]))
+
+    def test_another_layout_version_is_refused(self):
+        path = self.checkpoint("old.safetensors", version="0")
+        self.assertIn("not a w8a16 checkpoint", self.refused("--host", "127.0.0.1", "--w8a16-checkpoint", path))
+
+    def test_a_missing_or_corrupt_file_is_refused(self):
+        self.assertIn("cannot read", self.refused("--host", "127.0.0.1", "--w8a16-checkpoint",
+                                                  os.path.join(self.dir.name, "missing.safetensors")))
+        bad = os.path.join(self.dir.name, "bad.safetensors")
+        with open(bad, "wb") as handle:
+            handle.write(b"not a checkpoint at all")
+        self.refused("--host", "127.0.0.1", "--w8a16-checkpoint", bad)
+
+    def test_it_excludes_the_other_weight_sources_and_modes(self):
+        path = self.checkpoint("ok.safetensors")
+        self.assertIn("not both", self.refused("--host", "127.0.0.1", "--w8a16-checkpoint", path,
+                                               "--moshi-weight", "/x/model.safetensors"))
+        self.assertIn("mutually exclusive", self.refused("--host", "127.0.0.1", "--w8a16-checkpoint", path,
+                                                         "--fp8"))
+        self.assertIn("--cpu-offload", self.refused("--host", "127.0.0.1", "--w8a16-checkpoint", path,
+                                                    "--cpu-offload"))
+
+
 if __name__ == "__main__":
     unittest.main()
