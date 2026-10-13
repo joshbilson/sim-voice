@@ -20,6 +20,7 @@ from .sim_protocol import (
     load_token_file,
     read_default_text_prompt,
 )
+from .w8a16_format import CheckpointFormatError, check_w8a16_metadata, read_header
 
 DEFAULT_HF_REPO = "nvidia/personaplex-7b-v1"  # same value as moshi.models.loaders.DEFAULT_REPO
 
@@ -88,6 +89,11 @@ def build_arg_parser(default_hf_repo: str = DEFAULT_HF_REPO) -> argparse.Argumen
         "--w8a16", action="store_true",
         help="Weight-only 8-bit LM quantization, bf16 compute (Triton GEMV); exclusive with --fp8")
     parser.add_argument(
+        "--w8a16-checkpoint", type=str, default=None,
+        help="LM checkpoint already quantized to w8a16 by scripts/sim_quantize_checkpoint.py. Loaded "
+             "tensor by tensor, so start-up peaks near the final footprint. Implies --w8a16 and "
+             "replaces --moshi-weight.")
+    parser.add_argument(
         "--fast", action="store_true",
         help="Preset: --w8a16 --dep-q-exit 8 --skip-other-mimi --mimi-fp16")
     parser.add_argument(
@@ -106,6 +112,17 @@ def validate_serve_args(parser: argparse.ArgumentParser, args: argparse.Namespac
         parser.error("--gradio-tunnel was removed in the Sim fork: no third-party tunnels")
     if args.fp8 and args.w8a16:
         parser.error("--fp8 and --w8a16 are mutually exclusive")
+    if args.w8a16_checkpoint is not None:
+        if args.fp8:
+            parser.error("--w8a16-checkpoint and --fp8 are mutually exclusive")
+        if args.cpu_offload:
+            parser.error("--w8a16-checkpoint cannot be combined with --cpu-offload")
+        if args.moshi_weight is not None:
+            parser.error("pass --w8a16-checkpoint or --moshi-weight, not both")
+        try:
+            check_w8a16_metadata(read_header(args.w8a16_checkpoint).metadata)
+        except CheckpointFormatError as exc:
+            parser.error(f"--w8a16-checkpoint: {exc}")
     if not VOICE_RE.fullmatch(args.default_voice):
         parser.error("--default-voice must look like NATF2.pt")
     if args.max_backlog_frames < 1:

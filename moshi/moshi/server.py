@@ -54,6 +54,7 @@ from .sim_protocol import (
 )
 from .sim_session import SessionConfig, create_app
 from .utils.logging import setup_logger
+from .w8a16_checkpoint import load_lm_w8a16_checkpoint
 
 
 logger = setup_logger(__name__)
@@ -331,6 +332,15 @@ def _apply_fast_preset(args: argparse.Namespace) -> None:
     args.mimi_fp16 = True
 
 
+def _require_w8a16_runtime() -> None:
+    """The w8a16 decode kernel is Triton on CUDA; refuse before any weight is read."""
+    import importlib.util
+    if not torch.cuda.is_available():
+        raise SystemExit("--w8a16-checkpoint requires a CUDA device")
+    if importlib.util.find_spec("triton") is None:
+        raise SystemExit("--w8a16-checkpoint requires Triton (the w8a16 decode kernel)")
+
+
 def _serve(args: argparse.Namespace, token: Optional[str], default_text_prompt: str) -> None:
     seed_all(42424242)
     args.device = torch_auto_device(args.device)
@@ -373,25 +383,31 @@ def _serve(args: argparse.Namespace, token: Optional[str], default_text_prompt: 
     text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_path)  # type: ignore
 
     logger.info("loading moshi")
-    moshi_weight = _local_or_hf(args.moshi_weight, args.hf_repo, loaders.MOSHI_NAME)
-    lm = loaders.get_moshi_lm(moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
-    lm.eval()
-    if args.fp8:
-        if torch.cuda.is_available():
-            cc = torch.cuda.get_device_capability()
-            if cc < (8, 9):
-                raise SystemExit(
-                    f"--fp8 requires compute capability >= 8.9 for FP8 "
-                    f"torch._scaled_mm (found sm_{cc[0]}{cc[1]})")
-        from .fp8_quantize import quantize_model
-        logger.info("applying FP8 quantization...")
-        quantize_model(lm)
-        logger.info("FP8 quantization complete")
-    elif args.w8a16:
-        from .w8a16_quantize import quantize_model_w8a16
-        logger.info("applying w8a16 weight-only quantization...")
-        quantize_model_w8a16(lm)
-        logger.info("w8a16 quantization complete")
+    if args.w8a16_checkpoint is not None:
+        # Weights are already fp8 on disk: each tensor goes to the GPU once (see w8a16_checkpoint.py).
+        _require_w8a16_runtime()
+        lm = load_lm_w8a16_checkpoint(args.w8a16_checkpoint, device=args.device)
+        logger.info("w8a16 checkpoint loaded (weights were quantized offline)")
+    else:
+        moshi_weight = _local_or_hf(args.moshi_weight, args.hf_repo, loaders.MOSHI_NAME)
+        lm = loaders.get_moshi_lm(moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
+        lm.eval()
+        if args.fp8:
+            if torch.cuda.is_available():
+                cc = torch.cuda.get_device_capability()
+                if cc < (8, 9):
+                    raise SystemExit(
+                        f"--fp8 requires compute capability >= 8.9 for FP8 "
+                        f"torch._scaled_mm (found sm_{cc[0]}{cc[1]})")
+            from .fp8_quantize import quantize_model
+            logger.info("applying FP8 quantization...")
+            quantize_model(lm)
+            logger.info("FP8 quantization complete")
+        elif args.w8a16:
+            from .w8a16_quantize import quantize_model_w8a16
+            logger.info("applying w8a16 weight-only quantization...")
+            quantize_model_w8a16(lm)
+            logger.info("w8a16 quantization complete")
     logger.info("moshi loaded")
 
     state = ServerState(
@@ -443,6 +459,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     args = parser.parse_args(argv)
     token, default_text_prompt = validate_serve_args(parser, args)
     _apply_fast_preset(args)
+    if args.w8a16_checkpoint is not None:
+        args.w8a16 = True  # the checkpoint is a w8a16 model; the flags that depend on it follow
     with torch.no_grad():
         _serve(args, token, default_text_prompt)
 
