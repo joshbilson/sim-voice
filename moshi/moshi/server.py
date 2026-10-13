@@ -350,6 +350,16 @@ def _apply_fast_preset(args: argparse.Namespace) -> None:
     args.mimi_fp16 = True
 
 
+def _release_heap() -> None:
+    """Return freed heap pages to the OS. Loading and compiling leave a few hundred MB free but
+    resident in glibc's arenas; the server keeps that memory for its whole life otherwise."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass  # not glibc: nothing to release
+
+
 def _require_w8a16_runtime() -> None:
     """The w8a16 decode kernel is Triton on CUDA; refuse before any weight is read."""
     import importlib.util
@@ -442,6 +452,7 @@ def _serve(args: argparse.Namespace, token: Optional[str], default_text_prompt: 
     )
     logger.info("warming up the model")
     state.warmup(voice_prompt=args.default_voice, text_prompt=default_text_prompt)
+    _release_heap()
     if args.fp8:
         from .fp8_quantize import free_bf16_inproj
         free_bf16_inproj(lm)
