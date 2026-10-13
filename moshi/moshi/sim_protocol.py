@@ -36,7 +36,8 @@ MIN_TOKEN_CHARS = 16
 CODECS = ("opus", "pcm16")
 
 # fullmatch() is used everywhere: '$' would also accept a trailing newline.
-VOICE_RE = re.compile(r"[A-Za-z0-9_-]{1,40}\.pt")
+VOICE_RE = re.compile(r"[A-Za-z0-9_-]{1,40}\.pt")  # preset voice files (NATF2.pt); 'c-' names are reserved
+CUSTOM_VOICE_RE = re.compile(r"c-[a-z0-9][a-z0-9-]{1,40}\.pt")  # custom voices (c-<slug>.pt)
 SESSION_RE = re.compile(r"[A-Za-z0-9-]{1,64}")
 TOKEN_RE = re.compile(r"[\x21-\x7e]{%d,}" % MIN_TOKEN_CHARS)
 
@@ -83,9 +84,18 @@ class ChatParams:
     session: str
 
 
+def is_preset_name(name: str) -> bool:
+    """A preset voice file name such as NATF2.pt. Names starting with 'c-' belong to custom voices."""
+    return VOICE_RE.fullmatch(name) is not None and not name.startswith("c-")
+
+
+def is_voice_name(name: str) -> bool:
+    return is_preset_name(name) or CUSTOM_VOICE_RE.fullmatch(name) is not None
+
+
 def validate_voice_prompt(name: str, voices: Iterable[str]) -> str:
-    if not VOICE_RE.fullmatch(name):
-        raise BadRequest("voice_prompt must look like NATF2.pt")
+    if not is_voice_name(name):
+        raise BadRequest("voice_prompt must look like NATF2.pt or c-<slug>.pt")
     if name not in set(voices):
         raise BadRequest("voice_prompt is not available on this server")
     return name

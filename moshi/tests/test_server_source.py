@@ -30,7 +30,7 @@ def top_level_imports(source):
 
 class SourceRules(unittest.TestCase):
     def test_torch_free_modules_do_not_import_heavy_packages(self):
-        for name in ("sim_protocol.py", "sim_session.py", "sim_cli.py"):
+        for name in ("sim_protocol.py", "sim_session.py", "sim_cli.py", "sim_audio.py", "sim_voices.py"):
             with self.subTest(module=name):
                 for module in top_level_imports(read(name)):
                     root = module.split(".")[0]
