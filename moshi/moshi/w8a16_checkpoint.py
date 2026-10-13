@@ -51,7 +51,6 @@ logger = logging.getLogger(__name__)
 ROW_CHUNK = 1024  # rows per quantization step: bounds the fp32 temporaries to a few tens of MB
 FP8 = torch.float8_e4m3fn
 BF16 = torch.bfloat16
-ST_NAME = {BF16: "BF16", torch.float32: "F32", FP8: "F8_E4M3"}
 FREE_DISK_MARGIN = 1024 ** 3
 
 
@@ -75,10 +74,18 @@ def _raw(tensor: torch.Tensor) -> memoryview:
     return memoryview(np.ascontiguousarray(flat))
 
 
-def _st_dtype(dtype: torch.dtype) -> str:
-    if dtype not in ST_NAME:
-        raise CheckpointFormatError(f"no safetensors name for {dtype}")
-    return ST_NAME[dtype]
+def stored_dtype(name: str, dtype: torch.dtype) -> str:
+    """Safetensors dtype of a state-dict entry in the converted file.
+
+    The online loader casts every entry to bf16 before assigning it (get_moshi_lm), even where
+    the model declares fp32 (RMSNorm alpha). So everything is bf16 except the fp8 weights and the
+    fp32 w8a16 scales, which are the quantized layout itself.
+    """
+    if dtype == FP8:
+        return "F8_E4M3"
+    if name.endswith(("w8a16_scale", "_in_proj_q_scale")):
+        return "F32"
+    return "BF16"
 
 
 def _source_tensor(handle, recipe, shape) -> torch.Tensor:
@@ -138,21 +145,22 @@ def convert_checkpoint(
         grouped.update(outputs)
     regular = sorted(name for name in post if name not in grouped)
     for name in regular:
-        if name not in plan or post[name][1] != BF16:
-            raise CheckpointFormatError(f"{name} is neither quantized nor a bf16 model tensor")
+        if name not in plan:
+            raise CheckpointFormatError(f"{name} has no source in the checkpoint")
 
     entries = []  # physical order: (name, st dtype, shape, nbytes)
     items = []
     for name in regular:
         shape, dtype = post[name]
-        nbytes = int(np.prod(shape, dtype=np.int64)) * 2
-        items.append((name, "regular", None, [(name, _st_dtype(dtype), shape, nbytes)]))
+        st = stored_dtype(name, dtype)
+        nbytes = int(np.prod(shape, dtype=np.int64)) * ITEMSIZE[st]
+        items.append((name, "regular", None, [(name, st, shape, nbytes)]))
     for kind, source, outputs in groups:
         group_entries = []
         for out in outputs:
             shape, dtype = post[out]
-            nbytes = int(np.prod(shape, dtype=np.int64)) * ITEMSIZE[_st_dtype(dtype)]
-            group_entries.append((out, _st_dtype(dtype), shape, nbytes))
+            st = stored_dtype(out, dtype)
+            group_entries.append((out, st, shape, int(np.prod(shape, dtype=np.int64)) * ITEMSIZE[st]))
         items.append((outputs[0], kind, source, group_entries))
     items.sort(key=lambda item: item[0])
     for _, _, _, group_entries in items:
@@ -254,7 +262,7 @@ def load_lm_w8a16_checkpoint(path: str, *, device="cuda", lm_kwargs: Optional[di
         info = header.tensors.get(name)
         if info is None:
             problems.append(f"missing {name}")
-        elif info.shape != tuple(value.shape) or info.dtype != _st_dtype(value.dtype):
+        elif info.shape != tuple(value.shape) or info.dtype != stored_dtype(name, value.dtype):
             problems.append(f"{name}: file {info.dtype}{list(info.shape)}")
     extra = sorted(set(header.tensors) - set(expected))
     problems += [f"unexpected {name}" for name in extra]
