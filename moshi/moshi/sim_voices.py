@@ -25,6 +25,7 @@ from .sim_protocol import CUSTOM_VOICE_RE, is_preset_name
 SLUG = r"[a-z0-9][a-z0-9-]{1,40}"
 CUSTOM_ID_RE = re.compile(r"c-" + SLUG)
 BUILD_PREFIX = ".build-"
+UPLOAD_LIMIT_BYTES = 4 * 1024 * 1024  # PUT body limit (413 above this)
 
 
 def custom_slug(voice_id: str) -> Optional[str]:
