@@ -141,12 +141,13 @@ class AuthAndValidationTests(SimSessionTestCase):
         async with self.http.get(url, headers=self.auth()) as resp:
             self.assertEqual(resp.status, 200)
             body = await resp.json()
-        self.assertEqual(set(body), {"ok", "busy", "model", "fast", "voices", "uptimeS"})
+        self.assertEqual(set(body), {"ok", "busy", "model", "fast", "voices", "customVoices", "uptimeS"})
         self.assertIs(body["ok"], True)
         self.assertIs(body["busy"], False)
         self.assertEqual(body["model"], "personaplex-7b-v1")
         self.assertIs(body["fast"], False)
         self.assertEqual(body["voices"], ["NATF0.pt", "NATF2.pt"])
+        self.assertEqual(body["customVoices"], [])
         self.assertIsInstance(body["uptimeS"], int)
 
     async def test_unknown_api_paths_need_the_token_too(self):

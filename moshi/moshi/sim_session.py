@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from typing import Awaitable, Callable, Optional, Protocol, Sequence
 import numpy as np
 from aiohttp import WSMsgType, web
 
+from .sim_audio import VOICE_SECONDS, AudioError, VoiceSample, prepare_voice_sample, write_wav16
 from .sim_protocol import (
     CLOSE_NORMAL,
     DEFAULT_TEXT_PROMPT,
@@ -43,11 +45,17 @@ from .sim_protocol import (
     LatencyWindow,
     bearer_matches,
     error_message,
+    is_preset_name,
     json_message,
     parse_chat_query,
 )
+from .sim_voices import UPLOAD_LIMIT_BYTES, VoiceStore, custom_slug
 
 logger = logging.getLogger(__name__)
+
+CUSTOM_VOICES_OFF = "custom voices are not enabled on this server"
+VOICE_ID_HINT = "the voice id must look like c-<slug>: 2-41 lowercase letters, digits or dashes"
+BUSY_MESSAGE = "a call or a voice build is already in progress"
 
 
 class AudioCodec(Protocol):
@@ -83,6 +91,12 @@ class SimEngine(Protocol):
     def step(self, pcm: np.ndarray) -> list:
         """Feed one 1920-sample float32 frame. Returns [(pcm_out | None, text_piece | None), ...]."""
 
+    def build_voice_prompt(self, wav_path: str) -> int:
+        """Write the voice prompt for a 24 kHz sample: splitext(wav_path)[0] + '.pt'. Returns its frames.
+
+        Blocking. Runs in a worker thread while the busy gate is held, so no call uses the model.
+        """
+
     def new_codec(self, codec: str) -> AudioCodec:
         """A fresh codec object for one call ('pcm16' or 'opus')."""
 
@@ -98,6 +112,7 @@ class SessionConfig:
     max_session_s: float = 1800.0
     stats_interval_s: float = 2.0
     outbox_limit: int = 256
+    custom_voice_dir: Optional[str] = None  # None: custom voices are off (PUT answers 404)
 
     def __post_init__(self) -> None:
         if self.max_backlog_frames < 1:
@@ -123,7 +138,7 @@ def _auth_middleware(token: Optional[str]):
                 return web.json_response(
                     {"code": "unauthorized", "message": "missing or invalid bearer token"},
                     status=401,
-                    headers={"WWW-Authenticate": "Bearer"},
+                    headers={"WWW-Authenticate": "Bearer", "Connection": "close"},
                 )
         return await handler(request)
 
@@ -135,6 +150,9 @@ def create_app(engine: SimEngine, config: SessionConfig) -> web.Application:
     app = web.Application(middlewares=[_auth_middleware(config.auth_token)])
     app.router.add_get("/api/chat", server.handle_chat)
     app.router.add_get("/api/health", server.handle_health)
+    app.router.add_get("/api/voices/{name}", server.handle_voice_sample)
+    app.router.add_put("/api/voices/{name}", server.handle_voice_put)
+    app.router.add_delete("/api/voices/{name}", server.handle_voice_delete)
     return app
 
 
@@ -144,14 +162,22 @@ class SimServer:
         self.config = config
         self.busy = False
         self._started = time.monotonic()
+        self.store = VoiceStore(config.custom_voice_dir) if config.custom_voice_dir is not None else None
+
+    def _voice_names(self) -> list[str]:
+        """Presets, then custom voices (c-<slug>.pt). Both are valid voice_prompt values."""
+        custom = self.store.names() if self.store is not None else []
+        return list(self.engine.voices()) + custom
 
     async def handle_health(self, request: web.Request) -> web.Response:
+        custom = self.store.names() if self.store is not None else []
         return web.json_response({
             "ok": True,
             "busy": self.busy,
             "model": MODEL_NAME,
             "fast": self.config.fast,
-            "voices": list(self.engine.voices()),
+            "voices": list(self.engine.voices()) + custom,
+            "customVoices": custom,
             "uptimeS": int(time.monotonic() - self._started),
         })
 
@@ -159,7 +185,7 @@ class SimServer:
         try:
             params = parse_chat_query(
                 request.query,
-                voices=self.engine.voices(),
+                voices=self._voice_names(),
                 default_voice=self.config.default_voice,
                 default_text_prompt=self.config.default_text_prompt,
             )
@@ -186,6 +212,124 @@ class SimServer:
             except Exception as exc:
                 logger.error("session %s: engine reset failed (%s)", params.session, type(exc).__name__)
         return ws
+
+    # ---- custom voices: PUT / GET / DELETE /api/voices/<id> (bearer auth via the middleware) ----
+
+    async def handle_voice_put(self, request: web.Request) -> web.Response:
+        if self.store is None:
+            return _error(404, "not_found", CUSTOM_VOICES_OFF)
+        name = request.match_info["name"]
+        if is_preset_name(name):
+            return _error(403, "forbidden", "preset voices cannot be changed")
+        slug = custom_slug(name)
+        if slug is None:
+            return _error(400, "bad_request", VOICE_ID_HINT)
+        if self.busy:
+            return _error(409, "busy", BUSY_MESSAGE)
+        data = await _read_upload(request)
+        if data is None:
+            return _error(413, "too_large", f"the sample is larger than {UPLOAD_LIMIT_BYTES // (1024 * 1024)} MiB")
+        try:
+            sample = await asyncio.get_running_loop().run_in_executor(None, prepare_voice_sample, data)
+        except AudioError as exc:
+            return _error(400, "bad_audio", str(exc))
+        except Exception as exc:
+            logger.error("voice sample could not be read (%s)", type(exc).__name__)
+            return _error(500, "internal", "the sample could not be read")
+        data = None  # the raw upload is not kept during the build
+        if self.busy:  # a call may have started while the upload was read and decoded
+            return _error(409, "busy", BUSY_MESSAGE)
+        # Take the gate with no await since the check. _build_voice releases it, even if this
+        # request is cancelled: the model must never be used while a build still runs.
+        self.busy = True
+        build = asyncio.ensure_future(self._build_voice(slug, sample))
+        return await asyncio.shield(build)
+
+    async def _build_voice(self, slug: str, sample: VoiceSample) -> web.Response:
+        assert self.store is not None
+        started = time.monotonic()
+        build_dir = None
+        try:
+            build_dir = self.store.new_build_dir()
+            wav_path = os.path.join(build_dir, f"c-{slug}.wav")
+            write_wav16(wav_path, sample.pcm)
+            os.chmod(wav_path, 0o600)
+            frames = await asyncio.get_running_loop().run_in_executor(
+                None, self.engine.build_voice_prompt, wav_path)
+            pt_path = os.path.splitext(wav_path)[0] + ".pt"
+            if not isinstance(frames, int) or frames < 1 or not os.path.isfile(pt_path):
+                raise RuntimeError("the engine wrote no voice prompt")
+            os.chmod(pt_path, 0o600)
+            self.store.install(build_dir, slug)
+            ms = round((time.monotonic() - started) * 1000)
+            logger.info("custom voice built: frames=%d ms=%d", frames, ms)
+            return web.json_response(
+                {"voice": f"c-{slug}.pt", "seconds": VOICE_SECONDS, "frames": frames, "ms": ms}, status=201)
+        except Exception as exc:
+            # Type and location only: messages can echo audio or paths.
+            logger.error("custom voice build failed (%s)", type(exc).__name__)
+            return _error(500, "internal", "the voice could not be built")
+        finally:
+            try:
+                self.engine.reset()
+            except Exception as exc:
+                logger.error("engine reset after a voice build failed (%s)", type(exc).__name__)
+            self.busy = False
+            if build_dir is not None:
+                shutil.rmtree(build_dir, ignore_errors=True)
+
+    async def handle_voice_delete(self, request: web.Request) -> web.Response:
+        if self.store is None:
+            return _error(404, "not_found", CUSTOM_VOICES_OFF)
+        name = request.match_info["name"]
+        if is_preset_name(name):
+            return _error(403, "forbidden", "preset voices cannot be deleted")
+        slug = custom_slug(name)
+        if slug is None:
+            return _error(400, "bad_request", VOICE_ID_HINT)
+        if self.busy:
+            return _error(409, "busy", BUSY_MESSAGE)
+        if not self.store.delete(slug):
+            return _error(404, "not_found", "no such custom voice")
+        logger.info("custom voice deleted")
+        return web.Response(status=204)
+
+    async def handle_voice_sample(self, request: web.Request) -> web.StreamResponse:
+        if self.store is None:
+            return _error(404, "not_found", CUSTOM_VOICES_OFF)
+        name = request.match_info["name"]
+        if not name.startswith("c-") or not name.endswith(".wav"):
+            return _error(404, "not_found", "only custom voices have a sample (c-<slug>.wav)")
+        slug = custom_slug(name[:-len(".wav")])
+        if slug is None:
+            return _error(400, "bad_request", VOICE_ID_HINT)
+        if not self.store.has_sample(slug):
+            return _error(404, "not_found", "no such custom voice")
+        return web.FileResponse(self.store.wav_path(slug), headers={
+            "Content-Type": "audio/wav",
+            "Cache-Control": "private, no-store",
+        })
+
+
+def _error(status: int, code: str, message: str) -> web.Response:
+    # Connection: close. An error can be answered before the request body is read (a rejected
+    # PUT). A kept-alive connection would then stall the next request on it (measured: 75 s with
+    # aiohttp's client), so error responses always close.
+    return web.json_response({"code": code, "message": message}, status=status,
+                             headers={"Connection": "close"})
+
+
+async def _read_upload(request: web.Request) -> Optional[bytes]:
+    """The request body, or None when it is larger than UPLOAD_LIMIT_BYTES (declared or actual)."""
+    declared = request.content_length
+    if declared is not None and declared > UPLOAD_LIMIT_BYTES:
+        return None
+    buffer = bytearray()
+    async for chunk in request.content.iter_chunked(64 * 1024):
+        buffer.extend(chunk)
+        if len(buffer) > UPLOAD_LIMIT_BYTES:
+            return None
+    return bytes(buffer)
 
 
 async def _send_error(ws: web.WebSocketResponse, code: str, message: str) -> None:

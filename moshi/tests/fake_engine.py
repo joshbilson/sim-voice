@@ -6,6 +6,7 @@ the system-prompt arguments so tests can check defaults and validation.
 """
 
 import asyncio
+import os
 import time
 
 import numpy as np
@@ -31,13 +32,19 @@ class FakeOpusCodec:
 
 class FakeEngine:
     def __init__(self, voices=("NATF0.pt", "NATF2.pt"), prompt_delay_s=0.0, step_delay_s=0.0,
-                 fail_on_step=False, text_piece="a"):
-        self._voices = list(voices)
+                 fail_on_step=False, text_piece="a", custom_voice_dir=None, build_delay_s=0.0,
+                 fail_build=False, build_frames=50):
+        self._voices = list(voices)  # presets only, as the real engine
         self.prompt_delay_s = prompt_delay_s
         self.step_delay_s = step_delay_s
         self.fail_on_step = fail_on_step
         self.text_piece = text_piece
+        self.custom_voice_dir = custom_voice_dir
+        self.build_delay_s = build_delay_s
+        self.fail_build = fail_build
+        self.build_frames = build_frames
         self.prompts: list[dict] = []
+        self.builds = 0
         self.aborted_prompts = 0
         self.steps = 0
         self.resets = 0
@@ -46,6 +53,9 @@ class FakeEngine:
         return list(self._voices)
 
     async def run_system_prompts(self, *, voice_prompt, text_prompt, seed, is_alive) -> None:
+        if voice_prompt.startswith("c-"):  # custom voices resolve only in the custom directory
+            if self.custom_voice_dir is None or not os.path.isfile(os.path.join(self.custom_voice_dir, voice_prompt)):
+                raise FileNotFoundError("custom voice file is missing")
         self.prompts.append({"voice_prompt": voice_prompt, "text_prompt": text_prompt, "seed": seed})
         deadline = time.monotonic() + self.prompt_delay_s
         while time.monotonic() < deadline:
@@ -56,6 +66,17 @@ class FakeEngine:
 
     def reset(self) -> None:
         self.resets += 1
+
+    def build_voice_prompt(self, wav_path: str) -> int:
+        """Writes a dummy .pt next to the sample, as the real engine does (no torch)."""
+        if self.build_delay_s:
+            time.sleep(self.build_delay_s)  # blocking, like the embedding pass on the GPU
+        if self.fail_build:
+            raise RuntimeError("fake build failure")
+        with open(os.path.splitext(wav_path)[0] + ".pt", "wb") as handle:
+            handle.write(b"FAKE-VOICE-PROMPT")
+        self.builds += 1
+        return self.build_frames
 
     def step(self, pcm: np.ndarray) -> list:
         if self.fail_on_step:
