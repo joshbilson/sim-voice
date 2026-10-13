@@ -47,6 +47,39 @@ python3 scripts/sim_call_test.py --url http://127.0.0.1:8998 --token-file /path/
   --wav call.wav --voice NATF2.pt --out-wav out.wav --out-text out.txt
 ```
 
+## Low-peak start: converted w8a16 checkpoint
+
+Starting from the bf16 checkpoint and quantizing on the GPU needs the whole bf16 LM and its fp8
+copy at once: about 24 GiB of extra memory on a 16.7 GB model. Convert once, then start from the
+converted file:
+
+```sh
+OMP_NUM_THREADS=2 nice -n 10 python3 scripts/sim_quantize_checkpoint.py \
+  --src /path/to/model.safetensors --dst /path/to/w8a16/model.safetensors
+python3 scripts/sim_verify_w8a16.py --source /path/to/model.safetensors \
+  --converted /path/to/w8a16/model.safetensors --all --gpu
+python3 -m moshi.server --fast --host 127.0.0.1 --port 8998 --static none \
+  --w8a16-checkpoint /path/to/w8a16/model.safetensors \
+  --mimi-weight /path/to/mimi.safetensors --tokenizer /path/to/tokenizer_spm_32k_3.model \
+  --voice-prompt-dir /path/to/voices --auth-token-file /path/to/token --default-voice NATF2.pt \
+  --default-text-prompt-file /path/to/default-prompt.txt
+```
+
+- The converter quantizes on the CPU, one tensor at a time. The 16.7 GB LM converts in about 25 s;
+  its own memory is small (the source is memory-mapped and read once, so resident pages are
+  reclaimable). Output is written to `<dst>.partial` and renamed when complete.
+- The file holds fp8e4m3 weights and fp32 per-channel scales for the quantized layers, under the
+  names the modules use, and bf16 for everything else. Metadata: conversion version, source sha256,
+  min-features gate, and the LM configuration. The server refuses another version or configuration.
+- The server reads each tensor once with `pread` and copies it to the GPU, then drops its page-cache
+  range. Nothing is memory-mapped, so start-up peaks at the final footprint, not at the file size.
+- `--w8a16-checkpoint` implies `--w8a16` and replaces `--moshi-weight`. It excludes `--fp8` and
+  `--cpu-offload`. Without the flag, the online path is unchanged.
+- Numerics: quantization divides by a tensor, not a Python scalar, because CUDA rewrites a scalar
+  division as a multiply by the reciprocal. CPU and GPU therefore store identical bytes.
+  `sim_verify_w8a16.py --all --gpu` checks every quantized tensor (fp8 bytes and fp32 scale, CPU and
+  GPU) and every copied bf16 tensor against the source, and exits non-zero on any difference.
+
 ## Flags added by the fork
 
 | Flag | Default | Meaning |
@@ -59,6 +92,7 @@ python3 scripts/sim_call_test.py --url http://127.0.0.1:8998 --token-file /path/
 | `--max-session-seconds S` | `1800` | End the call (`timeout`, 4408) after this long. |
 | `--stats-interval-s S` | `2` | Seconds between stats messages (`0x06`). |
 | `--static DIR\|none` | `none` | Optional web UI directory. Never downloaded. |
+| `--w8a16-checkpoint PATH` | none | LM already quantized by `scripts/sim_quantize_checkpoint.py`. Implies `--w8a16`; replaces `--moshi-weight`. See the low-peak section. |
 | `--ssl DIR` | none | Load `cert.pem` and `key.pem` from `DIR`. Nothing is generated or downloaded. |
 
 Removed: `--gradio-tunnel` and `--gradio-tunnel-token` now fail with an error.
@@ -128,6 +162,11 @@ python3 -m unittest discover -s moshi/tests -v
 Needs only `aiohttp` and `numpy` (the pins in `pyproject.toml`). No torch and no GPU. The suite
 covers auth, validation, the handshake, PCM16 framing, busy, idle and session timeouts, backlog
 drops, error codes, opus routing, start-up refusals and the client script end to end.
+
+With torch installed (CPU is enough), `test_w8a16_checkpoint.py` also runs: quantization bit-identity,
+the converted file against the online path (both LM layouts, state and forward outputs), the
+original loader patches, and the refusals. Without torch those tests skip. Set `W8A16_SOURCE` and
+`W8A16_CONVERTED` to add a sampled real-tensor check.
 
 ## Licences and attribution
 
