@@ -24,7 +24,7 @@ def main(argv=None) -> None:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     token, default_text = validate_serve_args(parser, args)
-    engine = FakeEngine()
+    engine = FakeEngine(custom_voice_dir=args.custom_voice_dir)
     if args.default_voice not in engine.voices():
         parser.error("the fake engine offers only NATF0.pt and NATF2.pt")
     config = SessionConfig(
@@ -35,6 +35,7 @@ def main(argv=None) -> None:
         idle_timeout_s=args.idle_timeout_s,
         max_session_s=args.max_session_seconds,
         stats_interval_s=args.stats_interval_s,
+        custom_voice_dir=args.custom_voice_dir,
     )
     print("fake engine: echoes audio, emits 'a' per frame, loads no model", file=sys.stderr)
     web.run_app(create_app(engine, config), host=args.host, port=args.port, access_log=None)

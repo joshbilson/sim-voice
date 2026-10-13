@@ -30,6 +30,7 @@
 
 import argparse
 import asyncio
+import importlib.util
 import os
 import random
 import ssl
@@ -50,10 +51,11 @@ from .sim_protocol import (
     FRAME_SAMPLES,
     KIND_OPUS,
     MODEL_NAME,
-    VOICE_RE,
     Pcm16Codec,
+    is_preset_name,
 )
 from .sim_session import SessionConfig, create_app
+from .sim_voices import VoiceStore, voice_file_path
 from .utils.logging import setup_logger
 from .w8a16_checkpoint import load_lm_w8a16_checkpoint
 
@@ -93,15 +95,32 @@ def wrap_with_system_tags(text: str) -> str:
 
 
 def list_voice_files(directory: str) -> list[str]:
-    """Voice prompt files (NAT*.pt, VAR*.pt, ...) in a directory, sorted."""
+    """Preset voice prompt files (NAT*.pt, VAR*.pt, ...) in a directory, sorted. Custom voices are not listed here."""
     try:
         names = os.listdir(directory)
     except OSError:
         return []
     return sorted(
         name for name in names
-        if VOICE_RE.fullmatch(name) and os.path.isfile(os.path.join(directory, name))
+        if is_preset_name(name) and os.path.isfile(os.path.join(directory, name))
     )
+
+
+class _RngState:
+    """Every random generator the sampler draws from, so a voice build leaves none of them changed."""
+
+    def __init__(self) -> None:
+        self._torch = torch.get_rng_state()
+        self._cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        self._python = random.getstate()
+        self._numpy = np.random.get_state()
+
+    def restore(self) -> None:
+        torch.set_rng_state(self._torch)
+        if self._cuda is not None:
+            torch.cuda.set_rng_state_all(self._cuda)
+        random.setstate(self._python)
+        np.random.set_state(self._numpy)
 
 
 class OpusCodec:
@@ -130,12 +149,13 @@ class ServerState:
                  text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
                  save_voice_prompt_embeddings: bool = False, fp8: bool = False,
-                 pinned_io: bool = False, dep_q_exit: int = 0):
+                 pinned_io: bool = False, dep_q_exit: int = 0, custom_voice_dir: str | None = None):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
+        self.custom_voice_dir = custom_voice_dir
         self._fp8 = fp8
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         if self.frame_size != FRAME_SAMPLES:
@@ -200,10 +220,9 @@ class ServerState:
 
     async def run_system_prompts(self, *, voice_prompt: str, text_prompt: str,
                                  seed: Optional[int], is_alive) -> None:
-        # The session layer has validated voice_prompt (regex + listed in the voice dir); checked again here.
-        if os.path.basename(voice_prompt) != voice_prompt or not VOICE_RE.fullmatch(voice_prompt):
-            raise ValueError("voice prompt must be a plain file name")
-        voice_path = os.path.join(self.voice_prompt_dir, voice_prompt)
+        # The session layer validated voice_prompt. voice_file_path checks it again: c-<slug>.pt
+        # resolves only in the custom directory, and a preset name only in the preset directory.
+        voice_path = voice_file_path(voice_prompt, self.voice_prompt_dir, self.custom_voice_dir)
         if self.lm_gen.voice_prompt != voice_path:
             if voice_path.endswith('.pt'):
                 # Load pre-saved voice prompt embeddings
@@ -223,6 +242,36 @@ class ServerState:
         if self.other_mimi is not None:
             self.other_mimi.reset_streaming()
         self.lm_gen.reset_streaming()
+
+    def build_voice_prompt(self, wav_path: str) -> int:
+        """Custom voice: upstream's voice-prompt pass with embedding capture, saved next to wav_path.
+
+        Runs in a worker thread, called by sim_session with the busy gate held, so no call uses the
+        model meanwhile. Writes splitext(wav_path)[0] + '.pt', the file upstream writes for a voice
+        sample, and returns the number of saved frames. Streaming state and every RNG the sampler
+        draws from are restored, so the next call behaves as if no build had happened.
+        """
+        lm_gen = self.lm_gen
+        rng = _RngState()
+        with torch.no_grad():
+            self.reset()
+            try:
+                # The audio branch of the voice-prompt path. load_voice_prompt normalises to -24 LUFS,
+                # the level every preset was made at.
+                lm_gen.load_voice_prompt(wav_path)
+                lm_gen.save_voice_prompt_embeddings = True
+                for _ in lm_gen._step_voice_prompt_core(self.mimi):  # saves the .pt on its last step
+                    pass
+            finally:
+                lm_gen.save_voice_prompt_embeddings = False
+                self.reset()
+                lm_gen.voice_prompt = None  # the next call loads its own voice, never this sample
+                lm_gen.voice_prompt_audio = None
+                rng.restore()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        saved = torch.load(os.path.splitext(wav_path)[0] + ".pt", map_location="cpu", weights_only=True)
+        return int(saved["embeddings"].shape[0])
 
     def step(self, pcm: np.ndarray) -> list:
         """One 1920-sample float32 frame in; [(pcm_out, text_piece), ...] out (both may be None)."""
@@ -374,6 +423,14 @@ def _serve(args: argparse.Namespace, token: Optional[str], default_text_prompt: 
         raise SystemExit(f"--default-voice {args.default_voice} is not in the voice prompt directory")
     logger.info(f"voice prompts: {len(voices)} files")
 
+    custom_voice_dir = args.custom_voice_dir
+    if custom_voice_dir is not None:
+        if importlib.util.find_spec("pyloudnorm") is None:
+            raise SystemExit("--custom-voice-dir needs pyloudnorm (voice prompts are normalised to -24 LUFS): "
+                             "pip install pyloudnorm")
+        # Creates the directory (0700) now, so a bad path fails before the model loads.
+        logger.info(f"custom voices: {len(VoiceStore(custom_voice_dir).names())} files")
+
     _perf_flags = (args.fast or args.fp8 or args.w8a16 or args.skip_other_mimi
                    or args.mimi_fp16 or args.pinned_io or args.dep_q_exit > 0)
     if (not _perf_flags and torch.cuda.is_available()
@@ -439,6 +496,7 @@ def _serve(args: argparse.Namespace, token: Optional[str], default_text_prompt: 
         fp8=args.fp8,
         pinned_io=args.pinned_io,
         dep_q_exit=args.dep_q_exit,
+        custom_voice_dir=custom_voice_dir,
     )
     logger.info("warming up the model")
     state.warmup(voice_prompt=args.default_voice, text_prompt=default_text_prompt)
@@ -455,6 +513,7 @@ def _serve(args: argparse.Namespace, token: Optional[str], default_text_prompt: 
         idle_timeout_s=args.idle_timeout_s,
         max_session_s=args.max_session_seconds,
         stats_interval_s=args.stats_interval_s,
+        custom_voice_dir=custom_voice_dir,
     )
     app = create_app(state, config)
     if static_path is not None:

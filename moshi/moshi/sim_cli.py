@@ -14,12 +14,13 @@ from typing import Optional
 
 from .sim_protocol import (
     DEFAULT_VOICE,
-    VOICE_RE,
     TokenFileError,
     is_loopback_host,
+    is_preset_name,
     load_token_file,
     read_default_text_prompt,
 )
+from .sim_voices import check_custom_voice_dir
 from .w8a16_format import CheckpointFormatError, check_w8a16_metadata, read_header
 
 DEFAULT_HF_REPO = "nvidia/personaplex-7b-v1"  # same value as moshi.models.loaders.DEFAULT_REPO
@@ -39,6 +40,10 @@ def build_arg_parser(default_hf_repo: str = DEFAULT_HF_REPO) -> argparse.Argumen
                              "'Authorization: Bearer <token>'; a wrong or missing token gets HTTP 401.")
     parser.add_argument("--default-voice", type=str, default=DEFAULT_VOICE,
                         help="Voice used when a call does not name one (must be in the voice dir).")
+    parser.add_argument("--custom-voice-dir", type=str, default=None,
+                        help="Directory for custom voices: c-<slug>.pt and c-<slug>.wav, written by "
+                             "PUT /api/voices/c-<slug>. Created 0700 if missing; an existing one must not be "
+                             "group or world accessible.")
     parser.add_argument("--default-text-prompt-file", type=str,
                         help="File with the default text prompt (<= 1200 characters).")
     parser.add_argument("--max-backlog-frames", type=int, default=6,
@@ -123,8 +128,12 @@ def validate_serve_args(parser: argparse.ArgumentParser, args: argparse.Namespac
             check_w8a16_metadata(read_header(args.w8a16_checkpoint).metadata)
         except CheckpointFormatError as exc:
             parser.error(f"--w8a16-checkpoint: {exc}")
-    if not VOICE_RE.fullmatch(args.default_voice):
-        parser.error("--default-voice must look like NATF2.pt")
+    if not is_preset_name(args.default_voice):
+        parser.error("--default-voice must look like NATF2.pt (custom voices cannot be the default)")
+    if args.custom_voice_dir is not None:
+        problem = check_custom_voice_dir(args.custom_voice_dir)
+        if problem is not None:
+            parser.error(problem)
     if args.max_backlog_frames < 1:
         parser.error("--max-backlog-frames must be at least 1")
     if args.idle_timeout_s <= 0 or args.max_session_seconds <= 0 or args.stats_interval_s <= 0:

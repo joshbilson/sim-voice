@@ -88,6 +88,24 @@ class CliTests(unittest.TestCase):
         self.refused("--default-voice", "../NATF2.pt")
         self.refused("--default-voice", "NATF2.wav")
 
+    def test_custom_voices_are_off_by_default(self):
+        self.assertIsNone(self.parser.parse_args([]).custom_voice_dir)
+
+    def test_custom_voice_dir_may_be_missing_or_private_but_not_open(self):
+        path = os.path.join(self.dir.name, "voices-custom")
+        self.validate("--custom-voice-dir", path)  # missing: created 0700 when the server starts
+        os.mkdir(path, 0o700)
+        self.validate("--custom-voice-dir", path)
+        os.chmod(path, 0o755)
+        self.assertIn("group or world", self.refused("--custom-voice-dir", path))
+        plain = os.path.join(self.dir.name, "plain")
+        open(plain, "w").close()
+        self.assertIn("not a directory", self.refused("--custom-voice-dir", plain))
+        self.assertIn("parent", self.refused("--custom-voice-dir", os.path.join(self.dir.name, "x", "y")))
+
+    def test_a_custom_voice_cannot_be_the_default_voice(self):
+        self.refused("--default-voice", "c-warm-sim.pt")
+
     def test_default_text_prompt_file_is_read_and_limited(self):
         path = os.path.join(self.dir.name, "prompt.txt")
         with open(path, "w", encoding="utf-8") as handle:

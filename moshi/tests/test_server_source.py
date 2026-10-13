@@ -63,6 +63,32 @@ class SourceRules(unittest.TestCase):
     def test_request_lines_are_never_access_logged(self):
         self.assertIn("access_log=None", read("server.py"))
 
+    def test_embedding_capture_is_on_only_inside_the_voice_build(self):
+        # save_voice_prompt_embeddings is switched on in exactly one place, the custom voice build, and
+        # switched off again in that function's finally block, so calls never save embeddings.
+        source = read("server.py")
+        tree = ast.parse(source)
+
+        def sets(node, value):
+            return [n for n in ast.walk(node) if isinstance(n, ast.Assign)
+                    and any(isinstance(t, ast.Attribute) and t.attr == "save_voice_prompt_embeddings"
+                            for t in n.targets)
+                    and isinstance(n.value, ast.Constant) and n.value.value is value]
+
+        on_sites = [f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and sets(f, True)]
+        self.assertEqual([f.name for f in on_sites], ["build_voice_prompt"])
+        build = on_sites[0]
+        off_in_finally = [t for t in ast.walk(build) if isinstance(t, ast.Try)
+                          and any(sets(stmt, False) for stmt in t.finalbody)]
+        self.assertEqual(len(off_in_finally), 1)
+        self.assertIn("_step_voice_prompt_core(self.mimi)", source)
+        self.assertIn("with torch.no_grad():", ast.get_source_segment(source, build))
+
+    def test_custom_voice_directory_is_resolved_only_by_the_custom_path_rule(self):
+        server = read("server.py")
+        self.assertIn("voice_file_path(voice_prompt, self.voice_prompt_dir, self.custom_voice_dir)", server)
+        self.assertNotIn("os.path.join(self.voice_prompt_dir, voice_prompt)", server)
+
 
 class ImportPurity(unittest.TestCase):
     def test_session_layer_imports_without_torch_or_model_packages(self):
