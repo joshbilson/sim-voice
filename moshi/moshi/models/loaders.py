@@ -31,6 +31,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+from ..checkpoint_plan import Copy, Expand, plan_lm_state
 from .compression import MimiModel
 from .lm import LMModel
 from ..modules import SEANetEncoder, SEANetDecoder, transformer
@@ -163,6 +164,36 @@ def get_mimi(filename: str | Path,
     return model
 
 
+def default_lm_kwargs(delays=None) -> dict:
+    """Constructor kwargs of the PersonaPlex LM (dep_q=16). A fresh dict: callers may change it."""
+    lm_kwargs = dict(_lm_kwargs)
+    lm_kwargs["dep_q"] = 16
+    if delays is not None:
+        lm_kwargs["delays"] = delays
+    return lm_kwargs
+
+
+def apply_checkpoint_plan(model, state_dict, *, copy_missing_weights, dev, dtype):
+    """Build the state dict for model from a checkpoint's tensors, via plan_lm_state.
+
+    Shared by get_moshi_lm and tests. Keys the model does not have are dropped; every model key
+    gets a tensor on dev with dtype (copies of replicated slots and zeros included)."""
+    model_shapes = {k: tuple(v.shape) for k, v in model.state_dict().items()}
+    source_shapes = {k: tuple(v.shape) for k, v in state_dict.items()}
+    plan = plan_lm_state(model_shapes, source_shapes, copy_missing_weights=copy_missing_weights)
+    out = {}
+    for name, recipe in plan.items():
+        if isinstance(recipe, Copy):
+            tensor = state_dict[recipe.src]
+        elif isinstance(recipe, Expand):
+            tensor = torch.concat([state_dict[recipe.src], state_dict[recipe.src]], dim=0)
+        else:
+            logger.warning(f"Zero-initializing key missing from checkpoint: {name}")
+            tensor = torch.zeros(model_shapes[name], dtype=dtype, device=dev)
+        out[name] = tensor.to(device=dev, dtype=dtype)
+    return out
+
+
 def get_moshi_lm(
     filename: str | Path | None,
     copy_missing_weights: bool = True,
@@ -183,10 +214,7 @@ def get_moshi_lm(
                      insufficient. Uses accelerate's device_map="auto".
     """
     # Copy to avoid mutating a shared/global dict
-    lm_kwargs = dict(_lm_kwargs)
-    lm_kwargs["dep_q"] = 16
-    if delays is not None:
-        lm_kwargs["delays"] = delays
+    lm_kwargs = default_lm_kwargs(delays)
 
     if cpu_offload and filename is not None:
         return _get_moshi_lm_with_offload(
@@ -215,59 +243,11 @@ def get_moshi_lm(
         # torch checkpoint
         with open(filename, "rb") as f:
             state_dict = torch.load(f, map_location="cpu")
-    # Patch 1: expand depformer self_attn weights if needed
-    model_sd = model.state_dict()
-    for name, tensor in list(state_dict.items()):
-        if "depformer" in name and "self_attn" in name and name in model_sd:
-            if tensor.shape != model_sd[name].shape:
-                print("Expanding %s", name)
-                missing = (
-                    tensor
-                    if copy_missing_weights
-                    else model_sd[name][tensor.shape[0] :]
-                )
-                state_dict[name] = torch.concat([tensor, missing], dim=0)
-
-    # Patch 2: fill missing keys by copying 0..7 -> 8..15 for certain groups
-    if copy_missing_weights:
-        to_replace = ["gating", "linears", "depformer_in", "depformer_emb"]
-        for name in model_sd.keys():
-            if name in state_dict:
-                continue
-            replaced = False
-            for old, new in zip(range(8), range(8, 16)):
-                for rep in to_replace:
-                    needle = f"{rep}.{new}."
-                    if needle in name:
-                        src = name.replace(needle, f"{rep}.{old}.")
-                        if src in state_dict:
-                            print("Replacing %s <- %s", name, src)
-                            state_dict[name] = state_dict[src]
-                            replaced = True
-                        break
-                if replaced:
-                    break
-            if not replaced:
-                print("Missing %s", name)
-
-    # Assign weights to target device
+    # Patches (expansion of depformer self-attention, replicated slots, zero-fill) and the
+    # dtype cast: see checkpoint_plan.py. The dtype cast happens per tensor on dev.
     dev = torch.device(device) if isinstance(device, str) else device
-
-    # Patch 3: materialize any model parameters still absent from the
-    # checkpoint. The model is initialized on the meta device, so a key that
-    # is neither in the checkpoint nor covered by the patches above would
-    # survive load_state_dict(strict=False, assign=True) as a meta tensor and
-    # crash the final .to() with "Cannot copy out of meta tensor". This
-    # happens e.g. for depformer_emb.7 when expanding a base Moshi dep_q=8
-    # checkpoint to dep_q=16 (indices 8..15 are backfilled from 0..7, but
-    # index 7 itself does not exist in the checkpoint). Zero-init and warn.
-    for name, tensor in model_sd.items():
-        if name not in state_dict:
-            print(f"Zero-initializing key missing from checkpoint: {name}")
-            state_dict[name] = torch.zeros(tensor.shape, dtype=dtype, device=dev)
-    for key in state_dict:
-        state_dict[key] = state_dict[key].to(device=dev, dtype=dtype)
-    
+    state_dict = apply_checkpoint_plan(
+        model, state_dict, copy_missing_weights=copy_missing_weights, dev=dev, dtype=dtype)
     model.load_state_dict(state_dict, strict=False, assign=True)
     model.eval()
     return model.to(device=device, dtype=dtype)
