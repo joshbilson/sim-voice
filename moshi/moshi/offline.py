@@ -191,9 +191,8 @@ def run_inference(
     if seed is not None and seed != -1:
         seed_all(seed)
 
-    # Download config.json to increment download counter
-    # No worries about double-counting since config.json will be cached the second time
-    hf_hub_download(hf_repo, "config.json")
+    # Sim fork: no "download counter" request here. Weights come from local paths when given;
+    # hf_hub_download below runs only for a file that has no local path.
 
     # 1) Load Mimi encoders/decoders (same as server.py)
     log("info", "loading mimi")
