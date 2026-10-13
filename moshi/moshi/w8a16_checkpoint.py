@@ -240,6 +240,43 @@ def _check_written(path: str, entries: list, metadata: dict) -> None:
         raise CheckpointFormatError("written file has the wrong metadata")
 
 
+_TORCH_DTYPE = {"BF16": BF16, "F32": torch.float32, "F8_E4M3": FP8}
+
+
+def read_tensors_to_device(path: str, header, names: list, device: torch.device) -> dict:
+    """Copy the named tensors to device one at a time, reading them with pread.
+
+    Not mmap: a mapped file keeps its resident pages counted against free memory until the file
+    is closed, which is about the size of the checkpoint on top of the GPU copies. Here each tensor
+    is read into one aligned CPU buffer, copied, and its page-cache range dropped at once.
+    """
+    tensors = {}
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        for name in names:
+            info = header.tensors[name]
+            dtype = _TORCH_DTYPE[info.dtype]
+            if info.nbytes == 0:
+                tensors[name] = torch.empty(info.shape, dtype=dtype, device=device)
+                continue
+            cpu = torch.empty(info.nbytes, dtype=torch.uint8)
+            view = memoryview(cpu.numpy())
+            offset = header.data_start + info.begin
+            got = 0
+            while got < info.nbytes:
+                count = os.preadv(fd, [view[got:]], offset + got)
+                if count == 0:
+                    raise CheckpointFormatError(f"checkpoint ended early while reading {name}")
+                got += count
+            del view
+            tensors[name] = cpu.view(dtype).reshape(info.shape).to(device)
+            del cpu
+            os.posix_fadvise(fd, offset, info.nbytes, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+    return tensors
+
+
 def load_lm_w8a16_checkpoint(path: str, *, device="cuda", lm_kwargs: Optional[dict] = None) -> LMModel:
     """Build the quantized LM from a converted checkpoint, one stored tensor at a time.
 
@@ -270,10 +307,7 @@ def load_lm_w8a16_checkpoint(path: str, *, device="cuda", lm_kwargs: Optional[di
         raise CheckpointFormatError("w8a16 checkpoint does not match the model: " + "; ".join(problems[:5]))
 
     dev = torch.device(device)
-    tensors = {}
-    with safe_open(path, framework="pt", device="cpu") as handle:
-        for name in expected:
-            tensors[name] = handle.get_tensor(name).to(dev)
+    tensors = read_tensors_to_device(path, header, list(expected), dev)
     model.load_state_dict(tensors, strict=True, assign=True)
     del tensors
     if any(t.device.type != dev.type for t in list(model.parameters()) + list(model.buffers())):
